@@ -8,6 +8,8 @@ Usage:
 
 import argparse
 import logging
+import os
+import re
 import subprocess
 import sys
 from datetime import datetime
@@ -19,7 +21,29 @@ from summarize import append_summary, report_dates_from_paths
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 FORMATTER = SCRIPT_DIR / "trade-log-formatter.py"
-MASTER_XLSX = SCRIPT_DIR / "master-trades.xlsx"
+
+# The formatter writes the master workbook into the trades base folder (see
+# trade-log-formatter.py: os.path.join(BASE_PATH_TRADES, "master-trades.xlsx")),
+# NOT into this repo dir. summarize.py must read it from the same place — the
+# previous SCRIPT_DIR path never existed, which is why every day showed
+# "(master file missing)".
+TRADES_BASE = Path(os.getenv(
+    "TRADES_BASE_PATH",
+    "/Users/michaeljacinto/Library/CloudStorage/OneDrive-Personal/Desktop - onedrive/trades",
+))
+MASTER_XLSX = TRADES_BASE / "master-trades.xlsx"
+
+_MONTH_RE = re.compile(r"^\d{2}\.\d{4}$")
+
+
+def months_from_paths(paths: list[Path]) -> list[str]:
+    """Distinct MM.YYYY folder names the fetched reports landed in, in order."""
+    out: list[str] = []
+    for p in paths:
+        folder = p.parent.name
+        if _MONTH_RE.match(folder) and folder not in out:
+            out.append(folder)
+    return out
 
 
 def run_formatter(month: str, apply: bool = True) -> int:
@@ -81,10 +105,20 @@ def main() -> int:
             return 1
 
     if do_format:
+        # Format the month(s) the new reports actually landed in (parsed from
+        # the saved file paths), plus the explicitly-requested month. Without
+        # this, a month rollover meant June reports were fetched into 06.YYYY
+        # while the formatter only ran on the selected 05.YYYY — so the new
+        # trades were never written to the master and the summary came up empty.
+        months_to_format = months_from_paths(saved)
+        if args.month not in months_to_format:
+            months_to_format.append(args.month)
+        logging.info("Formatting month(s): %s", ", ".join(months_to_format))
         try:
-            rc = run_formatter(args.month, apply=args.apply)
-            if rc != 0:
-                raise RuntimeError(f"formatter exited with code {rc}")
+            for mth in months_to_format:
+                rc = run_formatter(mth, apply=args.apply)
+                if rc != 0:
+                    raise RuntimeError(f"formatter exited with code {rc} for {mth}")
         except Exception as e:
             report_failure(config, "formatter", e)
             logging.error("Formatter failed: %s", e)

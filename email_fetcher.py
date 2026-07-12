@@ -78,8 +78,16 @@ def parse_report_date(subject: str) -> datetime | None:
 
 
 def imap_since_string(days_back: int) -> str:
-    """IMAP SINCE wants a date like '01-Jan-2026'."""
-    since = (datetime.now(timezone.utc) - timedelta(days=days_back)).date()
+    """IMAP SINCE wants a date like '01-Jan-2026'.
+
+    SINCE filters server-side on INTERNALDATE by *date only*. We derive the
+    window from UTC now, which can already be the next calendar day when a run
+    fires late in the local evening — that used to clip a report sitting right
+    on the boundary (the 06/23/2026 report was skipped this way by a delayed
+    run). Subtract one extra day of margin so the boundary is always covered;
+    dedup (processed_uids / message-ids) makes the overlap free.
+    """
+    since = (datetime.now(timezone.utc) - timedelta(days=days_back + 1)).date()
     return since.strftime("%d-%b-%Y")
 
 

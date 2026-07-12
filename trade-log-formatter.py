@@ -292,35 +292,38 @@ def extract_trades_from_pdf(file_path):
     return trades
 
 def gather_all_trades(folder):
-    """Gather trades from all PDFs in chronological order"""
+    """Gather trades from all PDFs in chronological order.
+
+    Returns (trades, pending_filenames). The PDFs parsed in this run are
+    NOT yet marked as processed; the caller is responsible for marking
+    them only after all downstream writes (master-trades + journal) have
+    succeeded, so a decline at the journal-confirmation prompt leaves
+    the PDFs available for reprocessing.
+    """
     all_trades = []
-    # Get all PDF files and sort them by date in filename
+    pending_filenames = []
     pdf_files = glob(os.path.join(folder, "DailyTradeReport.*.pdf"))
-    
-    # Sort PDFs by date in filename (format: DailyTradeReport.YYYYMMDD.pdf)
     pdf_files.sort(key=lambda x: os.path.basename(x).split('.')[1])
-    
+
     processed_files = manage_processed_files(folder, check_only=True)
-    
+
     new_files = False
     for pdf in pdf_files:
         filename = os.path.basename(pdf)
         if filename in processed_files:
             debug_print(f"⏭️  Skipping previously processed file: {filename}")
             continue
-            
+
         new_files = True
         debug_print(f"\n📅 Processing {filename}")
         trades = extract_trades_from_pdf(pdf)
         all_trades.extend(trades)
-        
-        # Mark file as processed
-        manage_processed_files(folder, filename)
-    
+        pending_filenames.append(filename)
+
     if not new_files:
         print("\n📝 No new trade reports to process")
-    
-    return all_trades
+
+    return all_trades, pending_filenames
 
 def export_to_csv(trades, output_file, folder_path):
     """Export trades to CSV file in the same folder as PDFs"""
@@ -1125,6 +1128,15 @@ def update_trades_journal(consolidated_trades, folder_path):
     Open rows that receive a partial close are split into a closed lot row
     (appended) plus the original row with Qty reduced by the fill.
     Brand-new entries with no opposite-side open lot become appended rows.
+
+    Returns:
+        True  if the journal was updated, or no update was needed
+              (file/sheet missing, or no FIFO changes computed). The
+              caller should treat True as a green light to mark PDFs
+              processed and persist master-trades.
+        False if the user declined the confirmation prompt. The caller
+              should NOT mark PDFs processed and should NOT persist any
+              other writes from this run.
     """
     import shutil
     from openpyxl import load_workbook
@@ -1134,14 +1146,25 @@ def update_trades_journal(consolidated_trades, folder_path):
     journal_path = os.path.join(BASE_PATH_TRADES, JOURNAL_FILE)
     if not os.path.exists(journal_path):
         print(f"⚠️  {JOURNAL_FILE} not found at {journal_path}; skipping journal update")
-        return
+        return True
+
+    # Detect MS Office lockfile (~$Trades.xlsx) — Excel creates this when
+    # the file is open. Saving while Excel holds the lock either fails
+    # silently or gets overwritten by Excel on its next save.
+    lock_file = os.path.join(
+        os.path.dirname(journal_path), '~$' + os.path.basename(journal_path)
+    )
+    if os.path.exists(lock_file):
+        print(f"⚠️  {JOURNAL_FILE} appears to be open in Excel (lock file: {os.path.basename(lock_file)}).")
+        print(f"    Please close the workbook in Excel and re-run the script.")
+        return False
 
     print(f"\n📓 Preparing {JOURNAL_FILE} journal update preview...")
 
     wb = load_workbook(journal_path)
     if JOURNAL_SHEET not in wb.sheetnames:
         print(f"⚠️ '{JOURNAL_SHEET}' sheet not found in {JOURNAL_FILE}; skipping")
-        return
+        return True
     ws = wb[JOURNAL_SHEET]
 
     # Map first occurrence of each header to its column index. Duplicates
@@ -1162,7 +1185,7 @@ def update_trades_journal(consolidated_trades, folder_path):
     missing = [c for c in required if c not in headers]
     if missing:
         print(f"⚠️ Missing required columns in {JOURNAL_SHEET} sheet: {missing}; skipping")
-        return
+        return True
 
     # Find true last data row (last row with a non-empty Symbol).
     last_row = 1
@@ -1224,7 +1247,11 @@ def update_trades_journal(consolidated_trades, folder_path):
     split_children = []
     new_appends = []
     for r in out_rows:
-        if r.get('_split_child'):
+        # A split-child without an _xlsx_row was opened *and* partially closed
+        # in the same run — its parent isn't in the journal yet, so there's no
+        # row to copy static cols from. Treat both halves as new appends; the
+        # closed half will surface under DAY-TRADES via the Exit Date filter.
+        if r.get('_split_child') and r.get('_xlsx_row'):
             split_children.append(r)
         elif r.get('_xlsx_row'):
             if is_dirty(r):
@@ -1256,7 +1283,7 @@ def update_trades_journal(consolidated_trades, folder_path):
     if total == 0:
         print("  (no changes to apply)")
         print("=" * 72)
-        return
+        return True
 
     # Bucket in_place_updates further:
     #   newly_closed   = open → closed (snapshot Exit Qty blank, now filled)
@@ -1430,7 +1457,7 @@ def update_trades_journal(consolidated_trades, folder_path):
     answer = input("Apply these changes to Trades.xlsx? (y/N): ").strip().lower()
     if answer != 'y':
         print("⏭️  Skipped journal update — no changes written.")
-        return
+        return False
 
     # Confirmed — create backup now and proceed with writes.
     ts = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -1451,36 +1478,68 @@ def update_trades_journal(consolidated_trades, folder_path):
             return 'SHORT'
         return side_internal
 
+    # Discover the modal number_format that existing rows use for each
+    # FIFO-managed column. Applied to cells we write so dates render as
+    # '2026-05-06' instead of '2026-05-06 00:00:00', and times match the
+    # column's existing convention.
+    from collections import Counter
+
+    def _modal_format(col_idx):
+        formats = Counter()
+        for r in range(2, last_row + 1):
+            cell = ws.cell(row=r, column=col_idx)
+            if cell.value is None:
+                continue
+            fmt = cell.number_format
+            if fmt and fmt != 'General':
+                formats[fmt] += 1
+        return formats.most_common(1)[0][0] if formats else None
+
+    fifo_col_format = {}
+    for fname in ('Entry Date', 'Entry Time', 'Exit Date', 'Exit Time',
+                  'Entry Price', 'Exit Price', 'Qty', 'Exit Qty'):
+        if fname in headers:
+            fmt = _modal_format(headers[fname])
+            if fmt:
+                fifo_col_format[fname] = fmt
+
+    def _set_cell(target_row, field, value):
+        """Write value + apply the discovered number_format for that column."""
+        cell = ws.cell(row=target_row, column=headers[field])
+        cell.value = value
+        fmt = fifo_col_format.get(field)
+        if fmt:
+            cell.number_format = fmt
+
     def write_fifo_fields(target_row, rec):
         """Write only the FIFO-managed fields onto the given xlsx row."""
-        ws.cell(row=target_row, column=headers['Symbol']).value = rec['Symbol']
-        # Store Qty as positive integer in journal (user convention: LONG/SHORT
-        # carries the direction; Qty is magnitude).
+        _set_cell(target_row, 'Symbol', rec['Symbol'])
+        # Store Qty as positive integer (user convention: LONG/SHORT carries
+        # the direction; Qty is magnitude).
         qv = rec.get('Qty')
         if qv is not None:
-            ws.cell(row=target_row, column=headers['Qty']).value = abs(int(qv))
+            _set_cell(target_row, 'Qty', abs(int(qv)))
         ws.cell(row=target_row, column=headers['Side']).value = journal_side(rec.get('Side'))
-        ws.cell(row=target_row, column=headers['Entry Price']).value = rec.get('Entry Price')
-        ws.cell(row=target_row, column=headers['Entry Time']).value = rec.get('Entry Time')
+        _set_cell(target_row, 'Entry Price', rec.get('Entry Price'))
+        _set_cell(target_row, 'Entry Time', rec.get('Entry Time'))
         ed = rec.get('Entry Date')
-        ws.cell(row=target_row, column=headers['Entry Date']).value = (
-            datetime.strptime(ed, '%Y-%m-%d') if isinstance(ed, str) else ed
-        )
+        _set_cell(target_row, 'Entry Date',
+                  datetime.strptime(ed, '%Y-%m-%d') if isinstance(ed, str) else ed)
 
         eq = rec.get('Exit Qty')
         if eq is None or (isinstance(eq, float) and pd.isna(eq)):
-            ws.cell(row=target_row, column=headers['Exit Qty']).value = None
+            _set_cell(target_row, 'Exit Qty', None)
         else:
-            ws.cell(row=target_row, column=headers['Exit Qty']).value = abs(int(eq)) if isinstance(eq, (int, float)) and not pd.isna(eq) else eq
-        ws.cell(row=target_row, column=headers['Exit Price']).value = rec.get('Exit Price')
-        ws.cell(row=target_row, column=headers['Exit Time']).value = rec.get('Exit Time')
+            _set_cell(target_row, 'Exit Qty',
+                      abs(int(eq)) if isinstance(eq, (int, float)) and not pd.isna(eq) else eq)
+        _set_cell(target_row, 'Exit Price', rec.get('Exit Price'))
+        _set_cell(target_row, 'Exit Time', rec.get('Exit Time'))
         xd = rec.get('Exit Date')
         if xd is None or (isinstance(xd, float) and pd.isna(xd)):
-            ws.cell(row=target_row, column=headers['Exit Date']).value = None
+            _set_cell(target_row, 'Exit Date', None)
         else:
-            ws.cell(row=target_row, column=headers['Exit Date']).value = (
-                datetime.strptime(xd, '%Y-%m-%d') if isinstance(xd, str) else xd
-            )
+            _set_cell(target_row, 'Exit Date',
+                      datetime.strptime(xd, '%Y-%m-%d') if isinstance(xd, str) else xd)
 
     # For each column, find the most recent row (<= last_row) that contains
     # a formula in that column. Used as the translation source so we always
@@ -1597,40 +1656,68 @@ def update_trades_journal(consolidated_trades, folder_path):
         f"{n_new} new entry row(s) appended."
     )
     print(f"   - Journal had {pre_count} data rows; now has {next_append - 2} data rows.")
+    return True
+
+
+def _check_excel_lock(path, label):
+    """Return True if the workbook is open in Excel (lockfile present)."""
+    if not os.path.exists(path):
+        return False
+    lock = os.path.join(os.path.dirname(path), '~$' + os.path.basename(path))
+    if os.path.exists(lock):
+        print(f"⚠️  {label} appears to be open in Excel (lock file: {os.path.basename(lock)}).")
+        print(f"    Please close the workbook in Excel and re-run the script.")
+        return True
+    return False
 
 
 def process_folder(date_str):
-    """Process a single folder based on date string"""
+    """Process a single folder based on date string."""
     try:
         folder_path = get_folder_path(date_str)
         print(f"\n📁 Processing folder: {os.path.basename(folder_path)}")
-        
-        # Reset test files if in test mode
+
+        # Pre-flight: refuse to run if either workbook is open in Excel.
+        master_path = os.path.join(BASE_PATH_TRADES, MASTER_FILE)
+        journal_path = os.path.join(BASE_PATH_TRADES, JOURNAL_FILE)
+        if _check_excel_lock(master_path, MASTER_FILE) or _check_excel_lock(journal_path, JOURNAL_FILE):
+            return
+
         if TEST_MODE:
             reset_test_files(folder_path)
-        
-        # Get all trades from PDFs in the folder
-        all_trades = gather_all_trades(folder_path)
-        
+
+        # Parse PDFs but DO NOT yet mark them as processed — the marking
+        # happens at the end, only if the user confirms the journal update.
+        all_trades, pending_filenames = gather_all_trades(folder_path)
+
         if not all_trades:
             print("No new trades found to process.")
             return
-        
-        # Consolidate trades by symbol and date
+
         consolidated_trades = consolidate_trades(all_trades)
-        
+
         print(f"\n📊 Trade Summary:")
         print(f"   - Total individual trades: {len(all_trades)}")
         print(f"   - Consolidated trades: {len(consolidated_trades)}")
-        
-        # Update master sheet with consolidated trades (audit trail).
+
+        # Run journal preview + confirmation FIRST. If the user declines,
+        # we do not write master-trades or mark any PDFs — the next run
+        # will re-process the same PDFs from a clean slate.
+        confirmed = update_trades_journal(consolidated_trades, folder_path)
+        if confirmed is False:
+            print(f"\n⏭️  Run aborted: master-trades.xlsx not written, "
+                  f"{len(pending_filenames)} PDF(s) left unmarked for next run.")
+            return
+
+        # Confirmed (or no journal step required): write master-trades
+        # audit trail and mark the parsed PDFs as processed.
         update_master_sheet(consolidated_trades, folder_path)
 
-        # Update the user's Trades.xlsx journal with FIFO matching applied
-        # in-place (preserves formulas and custom columns).
-        update_trades_journal(consolidated_trades, folder_path)
+        for fn in pending_filenames:
+            manage_processed_files(folder_path, fn)
+        if pending_filenames:
+            print(f"📌 Marked {len(pending_filenames)} PDF(s) as processed.")
 
-        # Check and display open positions
         check_open_positions(folder_path)
         
     except (FileNotFoundError, ValueError) as e:

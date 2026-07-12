@@ -121,6 +121,13 @@ cython_debug/
 *.h5
 *.hdf5
 
+# Local secrets and email fetcher state
+config.json
+email_state.json
+email_state.json.tmp
+last_error.log
+daily_summary.md
+
 # Ignore environment files
 .env
 .env.*
