@@ -1095,6 +1095,43 @@ _JOURNAL_FIFO_COLS = {
 }
 
 
+def _extend_journal_table_ranges(ws, last_row):
+    """Grow the sheet's autofilter and saved-sort ranges to cover appended rows.
+
+    Excel stores both as fixed A1-style strings. Appending rows underneath does
+    not move them, so every run left the newest trades sitting outside the
+    filter: by August 2026 the filter still ended at row 483 while the data ran
+    to 504, and the whole month looked missing in Excel even though it was in
+    the file. Nothing here touches cell contents — only the two range
+    attributes — so it can't disturb the FIFO columns or the P/L formulas.
+    """
+    if last_row < 2:
+        return
+
+    af = getattr(ws, "auto_filter", None)
+    if af is None or not af.ref:
+        return  # no filter defined; nothing to keep in sync
+
+    def _col_of(ref, default="A"):
+        m = re.match(r"([A-Z]+)", str(ref or ""))
+        return m.group(1) if m else default
+
+    # Keep the filter's own right-hand column rather than widening to
+    # ws.max_column — the user chose that span.
+    end_col = _col_of(str(af.ref).split(":")[-1], "A")
+    af.ref = f"A1:{end_col}{last_row}"
+
+    sort_state = getattr(af, "sortState", None)
+    if sort_state is not None and sort_state.ref:
+        sort_end_col = _col_of(str(sort_state.ref).split(":")[-1], end_col)
+        # Data rows only — a sort range that includes the header drags it along.
+        sort_state.ref = f"A2:{sort_end_col}{last_row}"
+        for cond in (sort_state.sortCondition or []):
+            if cond.ref:
+                col = _col_of(str(cond.ref))
+                cond.ref = f"{col}2:{col}{last_row}"
+
+
 def _journal_normalize_date(v):
     """Normalize an Excel cell value to an ISO date string for FIFO comparison."""
     if v is None or v == '':
@@ -1647,6 +1684,9 @@ def update_trades_journal(consolidated_trades, folder_path):
             add_formulas_for_close(next_append)
         next_append += 1
         n_new += 1
+
+    # next_append points at the first free row, so the last data row is one back.
+    _extend_journal_table_ranges(ws, next_append - 1)
 
     wb.save(journal_path)
     print(
