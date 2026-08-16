@@ -1095,6 +1095,31 @@ _JOURNAL_FIFO_COLS = {
 }
 
 
+def _pnl_formula(headers, row):
+    """A side-aware Profit / Loss formula for one journal row.
+
+    The formula carried down the sheet is long-biased — proceeds minus cost:
+    `=(ExitQty*ExitPrice)-(EntryPrice*Qty)`. On a short that prints the P&L with
+    the sign inverted, so a covered short that lost money shows as a gain (BMNR
+    on 2026-06-11 read +21.51 in Excel against a real -21.51). QuantForge got
+    this right by flipping the sign for shorts when it recomputes, which is why
+    the app and the sheet disagreed on exactly that row.
+
+    Returns None when the sheet lacks a column this needs, so the caller can
+    fall back to copying whatever formula the previous row used.
+    """
+    from openpyxl.utils import get_column_letter
+
+    need = ('Side', 'Qty', 'Entry Price', 'Exit Qty', 'Exit Price')
+    if any(h not in headers for h in need):
+        return None
+    col = {h: get_column_letter(headers[h]) for h in need}
+    proceeds = f"({col['Exit Qty']}{row}*{col['Exit Price']}{row})"
+    cost = f"({col['Entry Price']}{row}*{col['Qty']}{row})"
+    is_short = f'LEFT(UPPER({col["Side"]}{row}),5)="SHORT"'
+    return f"=IF({is_short},{cost}-{proceeds},{proceeds}-{cost})"
+
+
 def _extend_journal_table_ranges(ws, last_row):
     """Grow the sheet's autofilter and saved-sort ranges to cover appended rows.
 
@@ -1649,8 +1674,16 @@ def update_trades_journal(consolidated_trades, folder_path):
             if header_name in _JOURNAL_FIFO_COLS:
                 continue
             target = ws.cell(row=dst_row, column=col_idx)
-            if target.value in (None, ''):
-                _translate_formula_into(col_idx, dst_row)
+            if target.value not in (None, ''):
+                continue
+            # P/L is authored rather than copied: the formula carried down the
+            # sheet is long-biased and inverts the sign on shorts.
+            if header_name == 'Profit / Loss':
+                authored = _pnl_formula(headers, dst_row)
+                if authored:
+                    target.value = authored
+                    continue
+            _translate_formula_into(col_idx, dst_row)
 
     next_append = last_row + 1
     n_updates = n_splits = n_new = 0
