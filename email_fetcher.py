@@ -118,6 +118,23 @@ def safe_filename(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9._\-]", "_", name)
 
 
+def report_pdf_on_disk(base: Path, report_date: datetime) -> Path | None:
+    """The already-downloaded PDF for this report date, if there is one.
+
+    Matches on the YYYYMMDD stamp anywhere in the filename rather than on an
+    exact name, so a renamed or safe_filename-mangled attachment still counts
+    as present instead of being downloaded a second time.
+    """
+    folder = base / report_date.strftime("%m.%Y")
+    if not folder.is_dir():
+        return None
+    stamp = report_date.strftime("%Y%m%d")
+    for p in sorted(folder.glob("*.pdf")):
+        if stamp in p.name:
+            return p
+    return None
+
+
 def fetch_new_reports(config: dict, state: dict) -> list[Path]:
     """Connect to IMAP, download new IB report PDFs, return list of saved paths."""
     host = config["imap_host"]
@@ -187,22 +204,22 @@ def fetch_new_reports(config: dict, state: dict) -> list[Path]:
 
         for uid_bytes in uids:
             uid = uid_bytes.decode()
-            if uid in processed_uids:
-                logger.debug("UID %s already processed, skipping", uid)
+
+            # Headers first. They're cheap, and they carry the report date —
+            # which is what lets the *disk* decide whether this one is already
+            # in hand. The processed-uid set is only an optimisation here; it
+            # is never allowed to veto a download, because a single desync
+            # between that list and the folder used to strand a report
+            # permanently (the 08/07/2026 report was lost exactly this way:
+            # uid marked, message-id absent, PDF never written).
+            typ, hdr = M.fetch(uid_bytes, "(BODY.PEEK[HEADER.FIELDS (SUBJECT MESSAGE-ID)])")
+            if typ != "OK" or not hdr or not hdr[0]:
+                logger.warning("Failed to fetch headers for UID %s", uid)
                 continue
 
-            typ, msg_data = M.fetch(uid_bytes, "(RFC822)")
-            if typ != "OK" or not msg_data or not msg_data[0]:
-                logger.warning("Failed to fetch UID %s", uid)
-                continue
-
-            msg = email.message_from_bytes(msg_data[0][1])
-            subject = decode_subject(msg.get("Subject", ""))
-            message_id = (msg.get("Message-ID") or "").strip()
-
-            if message_id and message_id in processed_msgids:
-                processed_uids.add(uid)
-                continue
+            head = email.message_from_bytes(hdr[0][1])
+            subject = decode_subject(head.get("Subject", ""))
+            message_id = (head.get("Message-ID") or "").strip()
 
             if not subject.startswith(subject_prefix):
                 logger.debug("UID %s subject %r doesn't match prefix, skipping", uid, subject)
@@ -223,22 +240,57 @@ def fetch_new_reports(config: dict, state: dict) -> list[Path]:
                     processed_msgids.add(message_id)
                 continue
 
+            existing = report_pdf_on_disk(download_base, report_date)
+            if existing:
+                logger.debug("Report %s already on disk (%s)", report_date.date(), existing.name)
+                # Also repairs a state file that lost track of a report it does
+                # in fact have.
+                processed_uids.add(uid)
+                if message_id:
+                    processed_msgids.add(message_id)
+                continue
+
+            if uid in processed_uids or (message_id and message_id in processed_msgids):
+                logger.warning(
+                    "UID %s (%s) is marked processed but no PDF is on disk — re-downloading",
+                    uid, subject,
+                )
+
+            typ, msg_data = M.fetch(uid_bytes, "(RFC822)")
+            if typ != "OK" or not msg_data or not msg_data[0]:
+                logger.warning("Failed to fetch UID %s", uid)
+                continue
+
+            msg = email.message_from_bytes(msg_data[0][1])
             attachments = extract_pdf_attachments(msg)
             if not attachments:
                 logger.warning("UID %s (%s) has no PDF attachments", uid, subject)
                 continue
 
             dest_folder = ensure_month_folder(download_base, report_date)
+            landed = False
             for fname, blob in attachments:
                 fname = safe_filename(fname)
                 dest = dest_folder / fname
                 if dest.exists():
                     logger.info("Already on disk: %s", dest)
+                    landed = True
                     continue
                 with open(dest, "wb") as f:
                     f.write(blob)
                 logger.info("Saved %s (%d bytes)", dest, len(blob))
                 saved_paths.append(dest)
+                landed = True
+
+            # Mark processed only once something is actually on disk. Marking
+            # unconditionally is what turned one bad run into a permanently
+            # missing trading day.
+            if not landed:
+                logger.warning(
+                    "UID %s (%s) produced no file — leaving unmarked so the next run retries",
+                    uid, subject,
+                )
+                continue
 
             processed_uids.add(uid)
             if message_id:
