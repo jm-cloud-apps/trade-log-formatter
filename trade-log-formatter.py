@@ -178,15 +178,31 @@ def extract_trades_from_pdf(file_path):
                                 is_option = is_option_trade(symbol)
                                 trade_symbol = symbol if is_option else symbol.split()[0]
                                 
-                                # For options, multiply price by 100
-                                raw_price = float(price.strip())
+                                # For options, multiply price by 100.
+                                #
+                                # THE BUG THIS FIXES (found 2026-08-26): IB prints
+                                # thousands separators, so a fill at $1,415.37 arrives
+                                # as the string "1,415.3700". `float()` raises ValueError
+                                # on that, the handler below swallowed it as a debug
+                                # line, and the fill vanished from the pipeline without
+                                # a trace — no error, no row, nothing to notice.
+                                #
+                                # Every fill priced >= $1,000 was silently dropped for
+                                # the life of the script. On this book that was four
+                                # fills: a whole GEV round trip (2026-04-23 -> 04-27,
+                                # never seen by master OR the journal) and both legs of
+                                # the SNDK exit on 2026-05-06, which is why SNDK read as
+                                # an open position that the trader knew he had closed.
+                                # Quantity gets the same treatment: a 1,000+ share fill
+                                # would fail identically.
+                                raw_price = float(price.strip().replace(',', ''))
                                 adjusted_price = raw_price * 100 if is_option else raw_price
                                 
                                 trade_data = {
                                     "Symbol": trade_symbol,
                                     "Date": datetime.split(',')[0],
                                     "Time": datetime.split(',')[1].strip(),
-                                    "Quantity": int(quantity.strip()),
+                                    "Quantity": int(quantity.strip().replace(',', '')),
                                     "Price": adjusted_price,
                                     "Side": trade_type
                                 }
@@ -201,9 +217,14 @@ def extract_trades_from_pdf(file_path):
                             # Skip to next potential transaction
                             i += 12
                         except (IndexError, ValueError) as e:
-                            debug_print(f"      ⚠️ Error parsing trade at line {i} on page {page_num + 1}")
-                            debug_print(f"      ⚠️ Error details: {str(e)}")
-                            debug_print(f"      ⚠️ Current line content: {lines[i] if i < len(lines) else 'EOF'}")
+                            # LOUD, not debug-only. This block sits on a U*** line, so
+                            # it is a real trade record we failed to read — the comma
+                            # bug above hid four fills here for months precisely because
+                            # this was invisible without DEBUG. A parse we cannot do is
+                            # a missing trade, and a missing trade must never be quiet.
+                            print(f"  \u26a0\ufe0f  UNPARSED TRADE RECORD in {os.path.basename(file_path)} "
+                                  f"(page {page_num + 1}, line {i}): {e}")
+                            print(f"      context: {lines[i:i + 8]}")
                             i += 1
                     else:
                         i += 1
@@ -1722,6 +1743,7 @@ def update_trades_journal(consolidated_trades, folder_path):
     _extend_journal_table_ranges(ws, next_append - 1)
 
     wb.save(journal_path)
+    _reapply_read_only_recommended(journal_path)
     print(
         f"✅ Updated {JOURNAL_FILE}: "
         f"{n_updates} row(s) updated in place, "
@@ -1730,6 +1752,54 @@ def update_trades_journal(consolidated_trades, folder_path):
     )
     print(f"   - Journal had {pre_count} data rows; now has {next_append - 2} data rows.")
     return True
+
+
+def _reapply_read_only_recommended(path):
+    """Re-stamp Excel's "read-only recommended" flag on a workbook we just saved.
+
+    THE FAILURE THIS DEFENDS AGAINST (2026-08-26): Trades.xlsx was left open in
+    Excel for eleven days. Excel keeps the workbook in memory and writes it back
+    on close, so it silently overwrote the file with an eleven-day-old copy —
+    508 rows became 500 and three columns vanished. The pre-flight lock check
+    below cannot prevent this: Excel wrote its stale copy *after* this script
+    had finished and released the file.
+
+    `readOnlyRecommended` makes Excel prompt and open read-only by default, so
+    a workbook opened for a look cannot save over newer rows. openpyxl has no
+    model for `fileSharing` and rewrites xl/workbook.xml from its own object
+    graph on every save, which drops the flag — hence re-stamping it here by
+    editing that one part and copying every other part through untouched.
+
+    Best-effort: a failure here must never fail a run that already wrote the
+    journal correctly.
+    """
+    import zipfile
+    import shutil
+
+    tag = '<fileSharing readOnlyRecommended="1" userName="QuantForge"/>'
+    try:
+        with zipfile.ZipFile(path) as zin:
+            xml = zin.read('xl/workbook.xml').decode('utf-8')
+            if 'fileSharing' in xml:
+                return False
+            if '<workbookPr' in xml:
+                # Schema order is fileVersion?, fileSharing?, workbookPr?, ...
+                patched = xml.replace('<workbookPr', tag + '<workbookPr', 1)
+            else:
+                cut = xml.index('>', xml.index('<workbook ')) + 1
+                patched = xml[:cut] + tag + xml[cut:]
+            items = zin.infolist()
+            payload = {i.filename: zin.read(i.filename) for i in items}
+        tmp = path + '.rotmp'
+        with zipfile.ZipFile(tmp, 'w', zipfile.ZIP_DEFLATED) as zout:
+            for i in items:
+                data = patched.encode('utf-8') if i.filename == 'xl/workbook.xml' else payload[i.filename]
+                zout.writestr(i, data)
+        shutil.move(tmp, path)
+        return True
+    except Exception as e:
+        print(f"   (could not re-apply read-only-recommended: {e})")
+        return False
 
 
 def _check_excel_lock(path, label):
