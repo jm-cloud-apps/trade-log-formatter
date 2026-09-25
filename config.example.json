@@ -1,0 +1,14 @@
+{
+  "imap_host": "imap.gmail.com",
+  "imap_port": 993,
+  "email": "you@gmail.com",
+  "app_password": "xxxx xxxx xxxx xxxx",
+  "ib_sender": "donotreply@interactivebrokers.com",
+  "subject_prefix": "Daily Trade Report for",
+  "download_base": "/Users/michaeljacinto/Library/CloudStorage/OneDrive-Personal/Desktop - onedrive/trades",
+  "lookback_days": 14,
+  "start_after_date": "2026-05-08",
+  "processed_label": "IB/Processed",
+  "alert_email_enabled": true,
+  "alert_email_to": "you@gmail.com"
+}

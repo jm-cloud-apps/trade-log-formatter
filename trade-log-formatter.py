@@ -178,15 +178,31 @@ def extract_trades_from_pdf(file_path):
                                 is_option = is_option_trade(symbol)
                                 trade_symbol = symbol if is_option else symbol.split()[0]
                                 
-                                # For options, multiply price by 100
-                                raw_price = float(price.strip())
+                                # For options, multiply price by 100.
+                                #
+                                # THE BUG THIS FIXES (found 2026-08-26): IB prints
+                                # thousands separators, so a fill at $1,415.37 arrives
+                                # as the string "1,415.3700". `float()` raises ValueError
+                                # on that, the handler below swallowed it as a debug
+                                # line, and the fill vanished from the pipeline without
+                                # a trace — no error, no row, nothing to notice.
+                                #
+                                # Every fill priced >= $1,000 was silently dropped for
+                                # the life of the script. On this book that was four
+                                # fills: a whole GEV round trip (2026-04-23 -> 04-27,
+                                # never seen by master OR the journal) and both legs of
+                                # the SNDK exit on 2026-05-06, which is why SNDK read as
+                                # an open position that the trader knew he had closed.
+                                # Quantity gets the same treatment: a 1,000+ share fill
+                                # would fail identically.
+                                raw_price = float(price.strip().replace(',', ''))
                                 adjusted_price = raw_price * 100 if is_option else raw_price
                                 
                                 trade_data = {
                                     "Symbol": trade_symbol,
                                     "Date": datetime.split(',')[0],
                                     "Time": datetime.split(',')[1].strip(),
-                                    "Quantity": int(quantity.strip()),
+                                    "Quantity": int(quantity.strip().replace(',', '')),
                                     "Price": adjusted_price,
                                     "Side": trade_type
                                 }
@@ -201,9 +217,14 @@ def extract_trades_from_pdf(file_path):
                             # Skip to next potential transaction
                             i += 12
                         except (IndexError, ValueError) as e:
-                            debug_print(f"      ⚠️ Error parsing trade at line {i} on page {page_num + 1}")
-                            debug_print(f"      ⚠️ Error details: {str(e)}")
-                            debug_print(f"      ⚠️ Current line content: {lines[i] if i < len(lines) else 'EOF'}")
+                            # LOUD, not debug-only. This block sits on a U*** line, so
+                            # it is a real trade record we failed to read — the comma
+                            # bug above hid four fills here for months precisely because
+                            # this was invisible without DEBUG. A parse we cannot do is
+                            # a missing trade, and a missing trade must never be quiet.
+                            print(f"  \u26a0\ufe0f  UNPARSED TRADE RECORD in {os.path.basename(file_path)} "
+                                  f"(page {page_num + 1}, line {i}): {e}")
+                            print(f"      context: {lines[i:i + 8]}")
                             i += 1
                     else:
                         i += 1
@@ -292,35 +313,38 @@ def extract_trades_from_pdf(file_path):
     return trades
 
 def gather_all_trades(folder):
-    """Gather trades from all PDFs in chronological order"""
+    """Gather trades from all PDFs in chronological order.
+
+    Returns (trades, pending_filenames). The PDFs parsed in this run are
+    NOT yet marked as processed; the caller is responsible for marking
+    them only after all downstream writes (master-trades + journal) have
+    succeeded, so a decline at the journal-confirmation prompt leaves
+    the PDFs available for reprocessing.
+    """
     all_trades = []
-    # Get all PDF files and sort them by date in filename
+    pending_filenames = []
     pdf_files = glob(os.path.join(folder, "DailyTradeReport.*.pdf"))
-    
-    # Sort PDFs by date in filename (format: DailyTradeReport.YYYYMMDD.pdf)
     pdf_files.sort(key=lambda x: os.path.basename(x).split('.')[1])
-    
+
     processed_files = manage_processed_files(folder, check_only=True)
-    
+
     new_files = False
     for pdf in pdf_files:
         filename = os.path.basename(pdf)
         if filename in processed_files:
             debug_print(f"⏭️  Skipping previously processed file: {filename}")
             continue
-            
+
         new_files = True
         debug_print(f"\n📅 Processing {filename}")
         trades = extract_trades_from_pdf(pdf)
         all_trades.extend(trades)
-        
-        # Mark file as processed
-        manage_processed_files(folder, filename)
-    
+        pending_filenames.append(filename)
+
     if not new_files:
         print("\n📝 No new trade reports to process")
-    
-    return all_trades
+
+    return all_trades, pending_filenames
 
 def export_to_csv(trades, output_file, folder_path):
     """Export trades to CSV file in the same folder as PDFs"""
@@ -1092,6 +1116,68 @@ _JOURNAL_FIFO_COLS = {
 }
 
 
+def _pnl_formula(headers, row):
+    """A side-aware Profit / Loss formula for one journal row.
+
+    The formula carried down the sheet is long-biased — proceeds minus cost:
+    `=(ExitQty*ExitPrice)-(EntryPrice*Qty)`. On a short that prints the P&L with
+    the sign inverted, so a covered short that lost money shows as a gain (BMNR
+    on 2026-06-11 read +21.51 in Excel against a real -21.51). QuantForge got
+    this right by flipping the sign for shorts when it recomputes, which is why
+    the app and the sheet disagreed on exactly that row.
+
+    Returns None when the sheet lacks a column this needs, so the caller can
+    fall back to copying whatever formula the previous row used.
+    """
+    from openpyxl.utils import get_column_letter
+
+    need = ('Side', 'Qty', 'Entry Price', 'Exit Qty', 'Exit Price')
+    if any(h not in headers for h in need):
+        return None
+    col = {h: get_column_letter(headers[h]) for h in need}
+    proceeds = f"({col['Exit Qty']}{row}*{col['Exit Price']}{row})"
+    cost = f"({col['Entry Price']}{row}*{col['Qty']}{row})"
+    is_short = f'LEFT(UPPER({col["Side"]}{row}),5)="SHORT"'
+    return f"=IF({is_short},{cost}-{proceeds},{proceeds}-{cost})"
+
+
+def _extend_journal_table_ranges(ws, last_row):
+    """Grow the sheet's autofilter and saved-sort ranges to cover appended rows.
+
+    Excel stores both as fixed A1-style strings. Appending rows underneath does
+    not move them, so every run left the newest trades sitting outside the
+    filter: by August 2026 the filter still ended at row 483 while the data ran
+    to 504, and the whole month looked missing in Excel even though it was in
+    the file. Nothing here touches cell contents — only the two range
+    attributes — so it can't disturb the FIFO columns or the P/L formulas.
+    """
+    if last_row < 2:
+        return
+
+    af = getattr(ws, "auto_filter", None)
+    if af is None or not af.ref:
+        return  # no filter defined; nothing to keep in sync
+
+    def _col_of(ref, default="A"):
+        m = re.match(r"([A-Z]+)", str(ref or ""))
+        return m.group(1) if m else default
+
+    # Keep the filter's own right-hand column rather than widening to
+    # ws.max_column — the user chose that span.
+    end_col = _col_of(str(af.ref).split(":")[-1], "A")
+    af.ref = f"A1:{end_col}{last_row}"
+
+    sort_state = getattr(af, "sortState", None)
+    if sort_state is not None and sort_state.ref:
+        sort_end_col = _col_of(str(sort_state.ref).split(":")[-1], end_col)
+        # Data rows only — a sort range that includes the header drags it along.
+        sort_state.ref = f"A2:{sort_end_col}{last_row}"
+        for cond in (sort_state.sortCondition or []):
+            if cond.ref:
+                col = _col_of(str(cond.ref))
+                cond.ref = f"{col}2:{col}{last_row}"
+
+
 def _journal_normalize_date(v):
     """Normalize an Excel cell value to an ISO date string for FIFO comparison."""
     if v is None or v == '':
@@ -1125,6 +1211,15 @@ def update_trades_journal(consolidated_trades, folder_path):
     Open rows that receive a partial close are split into a closed lot row
     (appended) plus the original row with Qty reduced by the fill.
     Brand-new entries with no opposite-side open lot become appended rows.
+
+    Returns:
+        True  if the journal was updated, or no update was needed
+              (file/sheet missing, or no FIFO changes computed). The
+              caller should treat True as a green light to mark PDFs
+              processed and persist master-trades.
+        False if the user declined the confirmation prompt. The caller
+              should NOT mark PDFs processed and should NOT persist any
+              other writes from this run.
     """
     import shutil
     from openpyxl import load_workbook
@@ -1134,14 +1229,25 @@ def update_trades_journal(consolidated_trades, folder_path):
     journal_path = os.path.join(BASE_PATH_TRADES, JOURNAL_FILE)
     if not os.path.exists(journal_path):
         print(f"⚠️  {JOURNAL_FILE} not found at {journal_path}; skipping journal update")
-        return
+        return True
+
+    # Detect MS Office lockfile (~$Trades.xlsx) — Excel creates this when
+    # the file is open. Saving while Excel holds the lock either fails
+    # silently or gets overwritten by Excel on its next save.
+    lock_file = os.path.join(
+        os.path.dirname(journal_path), '~$' + os.path.basename(journal_path)
+    )
+    if os.path.exists(lock_file):
+        print(f"⚠️  {JOURNAL_FILE} appears to be open in Excel (lock file: {os.path.basename(lock_file)}).")
+        print(f"    Please close the workbook in Excel and re-run the script.")
+        return False
 
     print(f"\n📓 Preparing {JOURNAL_FILE} journal update preview...")
 
     wb = load_workbook(journal_path)
     if JOURNAL_SHEET not in wb.sheetnames:
         print(f"⚠️ '{JOURNAL_SHEET}' sheet not found in {JOURNAL_FILE}; skipping")
-        return
+        return True
     ws = wb[JOURNAL_SHEET]
 
     # Map first occurrence of each header to its column index. Duplicates
@@ -1162,7 +1268,7 @@ def update_trades_journal(consolidated_trades, folder_path):
     missing = [c for c in required if c not in headers]
     if missing:
         print(f"⚠️ Missing required columns in {JOURNAL_SHEET} sheet: {missing}; skipping")
-        return
+        return True
 
     # Find true last data row (last row with a non-empty Symbol).
     last_row = 1
@@ -1224,7 +1330,11 @@ def update_trades_journal(consolidated_trades, folder_path):
     split_children = []
     new_appends = []
     for r in out_rows:
-        if r.get('_split_child'):
+        # A split-child without an _xlsx_row was opened *and* partially closed
+        # in the same run — its parent isn't in the journal yet, so there's no
+        # row to copy static cols from. Treat both halves as new appends; the
+        # closed half will surface under DAY-TRADES via the Exit Date filter.
+        if r.get('_split_child') and r.get('_xlsx_row'):
             split_children.append(r)
         elif r.get('_xlsx_row'):
             if is_dirty(r):
@@ -1256,7 +1366,7 @@ def update_trades_journal(consolidated_trades, folder_path):
     if total == 0:
         print("  (no changes to apply)")
         print("=" * 72)
-        return
+        return True
 
     # Bucket in_place_updates further:
     #   newly_closed   = open → closed (snapshot Exit Qty blank, now filled)
@@ -1430,7 +1540,7 @@ def update_trades_journal(consolidated_trades, folder_path):
     answer = input("Apply these changes to Trades.xlsx? (y/N): ").strip().lower()
     if answer != 'y':
         print("⏭️  Skipped journal update — no changes written.")
-        return
+        return False
 
     # Confirmed — create backup now and proceed with writes.
     ts = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -1451,36 +1561,68 @@ def update_trades_journal(consolidated_trades, folder_path):
             return 'SHORT'
         return side_internal
 
+    # Discover the modal number_format that existing rows use for each
+    # FIFO-managed column. Applied to cells we write so dates render as
+    # '2026-05-06' instead of '2026-05-06 00:00:00', and times match the
+    # column's existing convention.
+    from collections import Counter
+
+    def _modal_format(col_idx):
+        formats = Counter()
+        for r in range(2, last_row + 1):
+            cell = ws.cell(row=r, column=col_idx)
+            if cell.value is None:
+                continue
+            fmt = cell.number_format
+            if fmt and fmt != 'General':
+                formats[fmt] += 1
+        return formats.most_common(1)[0][0] if formats else None
+
+    fifo_col_format = {}
+    for fname in ('Entry Date', 'Entry Time', 'Exit Date', 'Exit Time',
+                  'Entry Price', 'Exit Price', 'Qty', 'Exit Qty'):
+        if fname in headers:
+            fmt = _modal_format(headers[fname])
+            if fmt:
+                fifo_col_format[fname] = fmt
+
+    def _set_cell(target_row, field, value):
+        """Write value + apply the discovered number_format for that column."""
+        cell = ws.cell(row=target_row, column=headers[field])
+        cell.value = value
+        fmt = fifo_col_format.get(field)
+        if fmt:
+            cell.number_format = fmt
+
     def write_fifo_fields(target_row, rec):
         """Write only the FIFO-managed fields onto the given xlsx row."""
-        ws.cell(row=target_row, column=headers['Symbol']).value = rec['Symbol']
-        # Store Qty as positive integer in journal (user convention: LONG/SHORT
-        # carries the direction; Qty is magnitude).
+        _set_cell(target_row, 'Symbol', rec['Symbol'])
+        # Store Qty as positive integer (user convention: LONG/SHORT carries
+        # the direction; Qty is magnitude).
         qv = rec.get('Qty')
         if qv is not None:
-            ws.cell(row=target_row, column=headers['Qty']).value = abs(int(qv))
+            _set_cell(target_row, 'Qty', abs(int(qv)))
         ws.cell(row=target_row, column=headers['Side']).value = journal_side(rec.get('Side'))
-        ws.cell(row=target_row, column=headers['Entry Price']).value = rec.get('Entry Price')
-        ws.cell(row=target_row, column=headers['Entry Time']).value = rec.get('Entry Time')
+        _set_cell(target_row, 'Entry Price', rec.get('Entry Price'))
+        _set_cell(target_row, 'Entry Time', rec.get('Entry Time'))
         ed = rec.get('Entry Date')
-        ws.cell(row=target_row, column=headers['Entry Date']).value = (
-            datetime.strptime(ed, '%Y-%m-%d') if isinstance(ed, str) else ed
-        )
+        _set_cell(target_row, 'Entry Date',
+                  datetime.strptime(ed, '%Y-%m-%d') if isinstance(ed, str) else ed)
 
         eq = rec.get('Exit Qty')
         if eq is None or (isinstance(eq, float) and pd.isna(eq)):
-            ws.cell(row=target_row, column=headers['Exit Qty']).value = None
+            _set_cell(target_row, 'Exit Qty', None)
         else:
-            ws.cell(row=target_row, column=headers['Exit Qty']).value = abs(int(eq)) if isinstance(eq, (int, float)) and not pd.isna(eq) else eq
-        ws.cell(row=target_row, column=headers['Exit Price']).value = rec.get('Exit Price')
-        ws.cell(row=target_row, column=headers['Exit Time']).value = rec.get('Exit Time')
+            _set_cell(target_row, 'Exit Qty',
+                      abs(int(eq)) if isinstance(eq, (int, float)) and not pd.isna(eq) else eq)
+        _set_cell(target_row, 'Exit Price', rec.get('Exit Price'))
+        _set_cell(target_row, 'Exit Time', rec.get('Exit Time'))
         xd = rec.get('Exit Date')
         if xd is None or (isinstance(xd, float) and pd.isna(xd)):
-            ws.cell(row=target_row, column=headers['Exit Date']).value = None
+            _set_cell(target_row, 'Exit Date', None)
         else:
-            ws.cell(row=target_row, column=headers['Exit Date']).value = (
-                datetime.strptime(xd, '%Y-%m-%d') if isinstance(xd, str) else xd
-            )
+            _set_cell(target_row, 'Exit Date',
+                      datetime.strptime(xd, '%Y-%m-%d') if isinstance(xd, str) else xd)
 
     # For each column, find the most recent row (<= last_row) that contains
     # a formula in that column. Used as the translation source so we always
@@ -1553,8 +1695,16 @@ def update_trades_journal(consolidated_trades, folder_path):
             if header_name in _JOURNAL_FIFO_COLS:
                 continue
             target = ws.cell(row=dst_row, column=col_idx)
-            if target.value in (None, ''):
-                _translate_formula_into(col_idx, dst_row)
+            if target.value not in (None, ''):
+                continue
+            # P/L is authored rather than copied: the formula carried down the
+            # sheet is long-biased and inverts the sign on shorts.
+            if header_name == 'Profit / Loss':
+                authored = _pnl_formula(headers, dst_row)
+                if authored:
+                    target.value = authored
+                    continue
+            _translate_formula_into(col_idx, dst_row)
 
     next_append = last_row + 1
     n_updates = n_splits = n_new = 0
@@ -1589,7 +1739,11 @@ def update_trades_journal(consolidated_trades, folder_path):
         next_append += 1
         n_new += 1
 
+    # next_append points at the first free row, so the last data row is one back.
+    _extend_journal_table_ranges(ws, next_append - 1)
+
     wb.save(journal_path)
+    _reapply_read_only_recommended(journal_path)
     print(
         f"✅ Updated {JOURNAL_FILE}: "
         f"{n_updates} row(s) updated in place, "
@@ -1597,40 +1751,116 @@ def update_trades_journal(consolidated_trades, folder_path):
         f"{n_new} new entry row(s) appended."
     )
     print(f"   - Journal had {pre_count} data rows; now has {next_append - 2} data rows.")
+    return True
+
+
+def _reapply_read_only_recommended(path):
+    """Re-stamp Excel's "read-only recommended" flag on a workbook we just saved.
+
+    THE FAILURE THIS DEFENDS AGAINST (2026-08-26): Trades.xlsx was left open in
+    Excel for eleven days. Excel keeps the workbook in memory and writes it back
+    on close, so it silently overwrote the file with an eleven-day-old copy —
+    508 rows became 500 and three columns vanished. The pre-flight lock check
+    below cannot prevent this: Excel wrote its stale copy *after* this script
+    had finished and released the file.
+
+    `readOnlyRecommended` makes Excel prompt and open read-only by default, so
+    a workbook opened for a look cannot save over newer rows. openpyxl has no
+    model for `fileSharing` and rewrites xl/workbook.xml from its own object
+    graph on every save, which drops the flag — hence re-stamping it here by
+    editing that one part and copying every other part through untouched.
+
+    Best-effort: a failure here must never fail a run that already wrote the
+    journal correctly.
+    """
+    import zipfile
+    import shutil
+
+    tag = '<fileSharing readOnlyRecommended="1" userName="QuantForge"/>'
+    try:
+        with zipfile.ZipFile(path) as zin:
+            xml = zin.read('xl/workbook.xml').decode('utf-8')
+            if 'fileSharing' in xml:
+                return False
+            if '<workbookPr' in xml:
+                # Schema order is fileVersion?, fileSharing?, workbookPr?, ...
+                patched = xml.replace('<workbookPr', tag + '<workbookPr', 1)
+            else:
+                cut = xml.index('>', xml.index('<workbook ')) + 1
+                patched = xml[:cut] + tag + xml[cut:]
+            items = zin.infolist()
+            payload = {i.filename: zin.read(i.filename) for i in items}
+        tmp = path + '.rotmp'
+        with zipfile.ZipFile(tmp, 'w', zipfile.ZIP_DEFLATED) as zout:
+            for i in items:
+                data = patched.encode('utf-8') if i.filename == 'xl/workbook.xml' else payload[i.filename]
+                zout.writestr(i, data)
+        shutil.move(tmp, path)
+        return True
+    except Exception as e:
+        print(f"   (could not re-apply read-only-recommended: {e})")
+        return False
+
+
+def _check_excel_lock(path, label):
+    """Return True if the workbook is open in Excel (lockfile present)."""
+    if not os.path.exists(path):
+        return False
+    lock = os.path.join(os.path.dirname(path), '~$' + os.path.basename(path))
+    if os.path.exists(lock):
+        print(f"⚠️  {label} appears to be open in Excel (lock file: {os.path.basename(lock)}).")
+        print(f"    Please close the workbook in Excel and re-run the script.")
+        return True
+    return False
 
 
 def process_folder(date_str):
-    """Process a single folder based on date string"""
+    """Process a single folder based on date string."""
     try:
         folder_path = get_folder_path(date_str)
         print(f"\n📁 Processing folder: {os.path.basename(folder_path)}")
-        
-        # Reset test files if in test mode
+
+        # Pre-flight: refuse to run if either workbook is open in Excel.
+        master_path = os.path.join(BASE_PATH_TRADES, MASTER_FILE)
+        journal_path = os.path.join(BASE_PATH_TRADES, JOURNAL_FILE)
+        if _check_excel_lock(master_path, MASTER_FILE) or _check_excel_lock(journal_path, JOURNAL_FILE):
+            return
+
         if TEST_MODE:
             reset_test_files(folder_path)
-        
-        # Get all trades from PDFs in the folder
-        all_trades = gather_all_trades(folder_path)
-        
+
+        # Parse PDFs but DO NOT yet mark them as processed — the marking
+        # happens at the end, only if the user confirms the journal update.
+        all_trades, pending_filenames = gather_all_trades(folder_path)
+
         if not all_trades:
             print("No new trades found to process.")
             return
-        
-        # Consolidate trades by symbol and date
+
         consolidated_trades = consolidate_trades(all_trades)
-        
+
         print(f"\n📊 Trade Summary:")
         print(f"   - Total individual trades: {len(all_trades)}")
         print(f"   - Consolidated trades: {len(consolidated_trades)}")
-        
-        # Update master sheet with consolidated trades (audit trail).
+
+        # Run journal preview + confirmation FIRST. If the user declines,
+        # we do not write master-trades or mark any PDFs — the next run
+        # will re-process the same PDFs from a clean slate.
+        confirmed = update_trades_journal(consolidated_trades, folder_path)
+        if confirmed is False:
+            print(f"\n⏭️  Run aborted: master-trades.xlsx not written, "
+                  f"{len(pending_filenames)} PDF(s) left unmarked for next run.")
+            return
+
+        # Confirmed (or no journal step required): write master-trades
+        # audit trail and mark the parsed PDFs as processed.
         update_master_sheet(consolidated_trades, folder_path)
 
-        # Update the user's Trades.xlsx journal with FIFO matching applied
-        # in-place (preserves formulas and custom columns).
-        update_trades_journal(consolidated_trades, folder_path)
+        for fn in pending_filenames:
+            manage_processed_files(folder_path, fn)
+        if pending_filenames:
+            print(f"📌 Marked {len(pending_filenames)} PDF(s) as processed.")
 
-        # Check and display open positions
         check_open_positions(folder_path)
         
     except (FileNotFoundError, ValueError) as e:
